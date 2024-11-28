@@ -1,103 +1,149 @@
-"""
-This script converts the IDD dataset into YOLO format
-"""
 import json
 import os
 from PIL import Image
 import shutil
 from tqdm import tqdm
+from pathlib import Path
+import numpy as np
+from shapely.geometry import Polygon
+import tarfile
+import io
 
-def download_and_extract():
-    """
-    Note: You'll need to manually download the dataset first from:
-    https://idd.insaan.iiit.ac.in/ after registration
-    """
-    # Create necessary directories
-    dirs = ['dataset/images/train', 'dataset/images/val', 
+def create_yolo_folders():
+    """Create YOLO format directory structure"""
+    dirs = ['dataset/images/train', 'dataset/images/val', 'dataset/images/test',
             'dataset/labels/train', 'dataset/labels/val']
     for dir_path in dirs:
         os.makedirs(dir_path, exist_ok=True)
 
-def convert_bbox_to_yolo(bbox, img_width, img_height):
-    """Convert IDD bbox to YOLO format"""
-    x, y, width, height = bbox
+def get_bbox_from_polygon(polygon_points, img_width, img_height):
+    """Convert polygon points to YOLO format bounding box"""
+    polygon = Polygon(polygon_points)
+    bounds = polygon.bounds  # (minx, miny, maxx, maxy)
     
-    # Convert to YOLO format (normalized coordinates)
-    x_center = (x + width/2) / img_width
-    y_center = (y + height/2) / img_height
-    norm_width = width / img_width
-    norm_height = height / img_height
+    # Convert to YOLO format (x_center, y_center, width, height)
+    x_center = (bounds[0] + bounds[2]) / 2 / img_width
+    y_center = (bounds[1] + bounds[3]) / 2 / img_height
+    width = (bounds[2] - bounds[0]) / img_width
+    height = (bounds[3] - bounds[1]) / img_height
     
-    return [x_center, y_center, norm_width, norm_height]
+    return [x_center, y_center, width, height]
 
-def convert_annotations(ann_file, output_dir, images_dir):
-    """Convert IDD JSON annotations to YOLO format"""
-    # IDD class mapping (modify based on your needs)
+def process_archive(archive_path):
+    """Process IDD dataset directly from tar.gz archive"""
+    # Class mapping
     class_mapping = {
-        'auto_rickshaw': 0,
+        'autorickshaw': 0,
         'car': 1,
-        'bus': 2,
-        'truck': 3,
+        'motorcycle': 2,
+        'rider': 3,
+        'truck': 4,
+        'bus': 5,
+        'vehicle fallback': 6,
         # Add other classes as needed
     }
     
-    with open(ann_file, 'r') as f:
-        annotations = json.load(f)
+    print("Creating directory structure...")
+    create_yolo_folders()
     
-    # Process each image
-    for image_info in tqdm(annotations['images']):
-        image_id = image_info['id']
-        img_width = image_info['width']
-        img_height = image_info['height']
+    print(f"Processing archive: {archive_path}")
+    with tarfile.open(archive_path, 'r:gz') as tar:
+        # Get all files in archive
+        all_files = tar.getmembers()
         
-        # Get annotations for this image
-        image_anns = [ann for ann in annotations['annotations'] 
-                     if ann['image_id'] == image_id]
-        
-        # Create YOLO format label file
-        label_file = os.path.join(output_dir, 
-                                f"{os.path.splitext(image_info['file_name'])[0]}.txt")
-        
-        with open(label_file, 'w') as f:
-            for ann in image_anns:
-                category_name = next(cat['name'] for cat in annotations['categories'] 
-                                  if cat['id'] == ann['category_id'])
+        # Process images first to get dimensions
+        image_info = {}
+        for member in tqdm(all_files, desc="Processing images"):
+            if not member.name.endswith('_leftImg8bit.png'):
+                continue
                 
-                if category_name in class_mapping:
-                    class_id = class_mapping[category_name]
-                    bbox = convert_bbox_to_yolo(ann['bbox'], img_width, img_height)
-                    f.write(f"{class_id} {' '.join([str(x) for x in bbox])}\n")
-
-def prepare_dataset():
-    """Main function to prepare the dataset"""
-    # 1. Create directory structure
-    download_and_extract()
+            # Extract split type (train/val/test) and filename
+            parts = member.name.split('/')
+            if len(parts) < 4 or 'leftImg8bit' not in parts:
+                continue
+                
+            split = parts[2]  # train/val/test
+            if split == 'test':
+                # Extract test images without labels
+                f = tar.extractfile(member)
+                img_data = f.read()
+                img = Image.open(io.BytesIO(img_data))
+                
+                # Save image
+                img_filename = f"{parts[3]}_{parts[4]}"
+                img_path = os.path.join('dataset/images/test', img_filename)
+                img.save(img_path)
+                continue
+                
+            # Store image dimensions and save image
+            f = tar.extractfile(member)
+            img_data = f.read()
+            img = Image.open(io.BytesIO(img_data))
+            img_width, img_height = img.size
+            
+            # Save image
+            img_filename = f"{parts[3]}_{parts[4]}"
+            img_path = os.path.join(f'dataset/images/{split}', img_filename)
+            img.save(img_path)
+            
+            # Store image info for label conversion
+            json_name = member.name.replace('leftImg8bit', 'gtFine').replace('.png', '_polygons.json')
+            image_info[json_name] = {
+                'width': img_width,
+                'height': img_height,
+                'split': split,
+                'img_filename': img_filename
+            }
+        
+        # Process labels
+        for member in tqdm(all_files, desc="Processing labels"):
+            if not member.name.endswith('_polygons.json'):
+                continue
+                
+            if member.name not in image_info:
+                continue
+                
+            info = image_info[member.name]
+            split = info['split']
+            img_width = info['width']
+            img_height = info['height']
+            
+            # Read JSON data
+            f = tar.extractfile(member)
+            label_data = json.load(f)
+            
+            # Create YOLO format label file
+            label_filename = info['img_filename'].replace('.png', '.txt')
+            label_path = os.path.join(f'dataset/labels/{split}', label_filename)
+            
+            # Convert annotations
+            with open(label_path, 'w') as f:
+                for obj in label_data['objects']:
+                    if obj['label'] in class_mapping and not obj['deleted']:
+                        class_id = class_mapping[obj['label']]
+                        # Convert polygon points to list of coordinates
+                        polygon_points = np.array(obj['polygon'])
+                        bbox = get_bbox_from_polygon(polygon_points, img_width, img_height)
+                        
+                        # Write YOLO format line
+                        f.write(f"{class_id} {' '.join([str(x) for x in bbox])}\n")
     
-    # 2. Convert annotations
-    convert_annotations(
-        'path/to/idd_annotations_train.json',
-        'dataset/labels/train',
-        'dataset/images/train'
-    )
-    convert_annotations(
-        'path/to/idd_annotations_val.json',
-        'dataset/labels/val',
-        'dataset/images/val'
-    )
-    
-    # 3. Create dataset.yaml
+    print("Creating dataset.yaml...")
+    # Create dataset.yaml
     yaml_content = """
 path: ./dataset  # dataset root dir
 train: images/train  # train images
 val: images/val  # val images
+test: images/test  # test images
 
 # Classes
-nc: 4  # number of classes
-names: ['auto_rickshaw', 'car', 'bus', 'truck']  # class names
+nc: 7  # number of classes
+names: ['autorickshaw', 'car', 'motorcycle', 'rider', 'truck', 'bus', 'vehicle fallback']  # class names
 """
     
     with open('dataset.yaml', 'w') as f:
         f.write(yaml_content)
 
 if __name__ == "__main__":
-    prepare_dataset()
+    archive_path = "dataset/idd-segmentation.tar.gz"
+    process_archive(archive_path)
