@@ -1,0 +1,9 @@
+
+path: C:/Users/Rudro/source/repos/tuktuk-detection/dataset  # dataset root dir
+train: images/train  # train images
+val: images/val  # val images
+test: images/test  # test images
+
+# Classes
+nc: 7  # number of classes
+names: ['autorickshaw', 'car', 'motorcycle', 'rider', 'truck', 'bus', 'vehicle fallback']  # class names
